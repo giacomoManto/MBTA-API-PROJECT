@@ -7,6 +7,7 @@ import json
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
+import time
 
 class RequestType(Enum):
     alerts = 'alerts'
@@ -22,9 +23,11 @@ class RequestType(Enum):
     trips = 'trips'
     vehicles = 'vehicles'
 
-totalRequests = 0
-class ApiRequestBuilder:
 
+class ApiRequestBuilder:
+    ratelimit = 20
+    ratelimit_remaining = ratelimit
+    ratelimit_reset = time.time() + 60
     def __init__(self, type: RequestType, id = None, endpoint = "https://api-v3.mbta.com/"):
         self.api = endpoint
         self.payload = {}
@@ -63,9 +66,23 @@ class ApiRequestBuilder:
         return self
     
     def get(self) -> requests.Response:
-        global totalRequests
-        totalRequests += 1
-        return requests.get(self.api, params=self.payload, headers=self.headers)
+        if ApiRequestBuilder.ratelimit_remaining <= 0 and time.time() < ApiRequestBuilder.ratelimit_reset:
+            while time.time() < ApiRequestBuilder.ratelimit_reset:
+                print(f"Rate limit hit. Sleeping for {ApiRequestBuilder.ratelimit_reset - time.time()} seconds.")
+                time.sleep(1)
+        
+        response = requests.get(self.api, params=self.payload, headers=self.headers)
+        ApiRequestBuilder.ratelimit = int(response.headers['x-ratelimit-limit'])
+        ApiRequestBuilder.ratelimit_remaining = int(response.headers['x-ratelimit-remaining'])
+        ApiRequestBuilder.ratelimit_reset = int(response.headers['x-ratelimit-reset'])
+
+        if ApiRequestBuilder.ratelimit_remaining % 10 == 0:
+            print(f"{ApiRequestBuilder.ratelimit - ApiRequestBuilder.ratelimit_remaining} requests in current limit period.")
+        if response.status_code == 429:
+            print(f"Requested past rate limit. Sleeping for {ApiRequestBuilder.ratelimit_reset - time.time()} seconds.")
+            time.sleep(ApiRequestBuilder.ratelimit_reset - time.time())
+            return self.get()
+        return response
 
 
 # def routes(id = None):
@@ -90,37 +107,47 @@ print("MEOW")
 routes = ApiRequestBuilder(RequestType.routes).filter("type", "0", "1").get()
 print(routes.url)
 
-routeData = {'Name': [], 'Shapes': [], 'Color': []}
+routeData = {}
 for route in routes.json()['data']:
-    routeData['Name'].append(f"{route['id']}")
-    routeData['Color'].append(route['attributes']['color'])
+    routeData[route['id']] = {'color': route['attributes']['color'], 'shapes': {}}
     shapes = ApiRequestBuilder(RequestType.shapes).filter("route", route['id']).get()
-    curShapes = []
+    curShapes = {}
     for shape in shapes.json()['data']:
-        data = {'id': shape['id'], "Lat": [], "Long":[]}
+        data = {"Lat": [], "Long":[]}
         for lat, lon in polyline.decode(shape['attributes']['polyline']):
             data['Lat'].append(float(lat))
             data['Long'].append(float(lon))
-        curShapes.append(data)
-    routeData['Shapes'].append(curShapes)
-    
+            pass
+        routeData[route['id']]['shapes'][shape['id']] = data
+    vehicles = ApiRequestBuilder(RequestType.vehicles).filter("route", route['id']).get()
+    routeData[route['id']]['vehicles'] = {}
+    for vehicle in vehicles.json()['data']:
+        routeData[route['id']]['vehicles'][vehicle['id']] = {'long': vehicle['attributes']['longitude'], 'lat': vehicle['attributes']['latitude']}
+
 fig = go.Figure(go.Scattergeo())
 
-for pos in range(len(routeData['Name'])):
-    name = routeData['Name'][pos]
-    color = f"#{routeData['Color'][pos]}"
-    shapes = routeData['Shapes'][pos]
-    for shape in shapes:
-        fig.add_scattermapbox(lat=shape['Lat'], lon=shape['Long'], name=f"{name}-{shape['id']}",
+for route in routeData:
+    name = route
+    color = f"#{routeData[route]['color']}"
+    shapes = routeData[route]['shapes']
+    # for shape in shapes:
+    #     fig.add_scattermapbox(lat=shapes[shape]['Lat'], lon=shapes[shape]['Long'], name=f"{name}-{shape}",
+    #                           marker=dict(
+    #                                 color=color,
+    #                           ),
+    #                           mode='lines')
+    for vehicle in routeData[route]['vehicles']:
+        fig.add_scattermapbox(lat=[routeData[route]['vehicles'][vehicle]['lat']],
+                              lon=[routeData[route]['vehicles'][vehicle]['long']],
+                              name=f"{vehicle}",
                               marker=dict(
                                     color=color,
                               ),
-                              mode='lines')
+                              mode='markers')
 
 fig.update_layout(mapbox_style="open-street-map")
 fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
 fig.show()
-print(totalRequests)
 
 # fig = px.scatter_mapbox(df, 
 #                         lat="Lat", 
